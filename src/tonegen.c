@@ -201,7 +201,7 @@ static short const wheelPairs[92] = {
  * the tonegenerator for the upper (north) manual
  */
 static short const northTransformers[] = {
-	85, 66, 90, 71, 47, 64, 86, 69, 45, 62, 86, 67, 91, 72, 48, 65, 89, 70,
+	85, 66, 90, 71, 47, 64, 88, 69, 45, 62, 86, 67, 91, 72, 48, 65, 89, 70,
 	46, 63, 87, 68, 44, 61,
 	0
 };
@@ -813,15 +813,17 @@ findEastWestNeighbours (short const* const v, int w, int* ep, int* wp)
 /**
  * Auxilliary function to applyDefaultConfiguration.
  */
-static void
+static int
 findTransformerNeighbours (int w, int* ep, int* wp)
 {
 	if (findEastWestNeighbours (northTransformers, w, ep, wp)) {
-		return;
+		return 1;
 	} else if (findEastWestNeighbours (southTransformers, w, ep, wp)) {
-		return;
+		return 1;
 	} else {
-		assert (0);
+		/* Wheel not present in either transformer row: skip crosstalk for
+		 * it instead of aborting (matches NDEBUG behaviour). */
+		return 0;
 	}
 }
 
@@ -866,7 +868,9 @@ applyDefaultConfiguration (struct b_tonegen* t)
 			int east = 0;
 			int west = 0;
 
-			findTransformerNeighbours (i, &east, &west);
+			if (!findTransformerNeighbours (i, &east, &west)) {
+				continue;
+			}
 
 			if (0 < east) {
 				lep                      = newConfigListElement (t);
