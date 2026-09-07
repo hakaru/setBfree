@@ -236,7 +236,7 @@ static short const terminalStrip[] = {
 /* Forward declarations for serial contact switching */
 static void cancelPendingContacts (struct b_tonegen* t, int keyNumber);
 static void processPendingContacts (struct b_tonegen* t);
-static void activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus);
+static void activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus, float gain);
 
 static void
 initValues (struct b_tonegen* t)
@@ -347,6 +347,14 @@ initValues (struct b_tonegen* t)
 	t->contactStaggerFastMs = 0.5;
 	t->serialContactEnabled = 0;
 	memset (t->keyVelocity, 127, sizeof (t->keyVelocity));
+	{
+		int k;
+		for (k = 0; k < MAX_KEYS; k++)
+			t->keyGain[k] = 1.0f;
+		for (k = 0; k < MSGQSZ; k++)
+			t->msgQueueGain[k] = 1.0f;
+	}
+	t->nextKeyGain = 1.0f;
 }
 
 /**
@@ -3066,6 +3074,17 @@ oscKeyOff (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey)
 }
 
 /**
+ * Gain used by the next oscKeyOn (elepiano layer split). It is captured into
+ * the KEY_ON message / pending contact, so a later change does not affect a
+ * key that is already down.
+ */
+void
+setNextKeyGain (struct b_tonegen* t, float gain)
+{
+	t->nextKeyGain = gain < 0.0f ? 0.0f : gain;
+}
+
+/**
  * This function is the entry point for the MIDI parser when it has received
  * a NOTE ON message on a channel and note number mapped to a playing key.
  */
@@ -3103,6 +3122,7 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
 		if (t->pendingContactCount < MAX_PENDING_KEYS) {
 			int idx = t->pendingContactCount++;
 			t->pendingContacts[idx].keyNumber = keyNumber;
+			t->pendingContacts[idx].gain      = t->nextKeyGain;
 			t->pendingContacts[idx].busDelay[0] = 0; /* bus 0: immediate */
 			int k;
 			for (k = 1; k < 9; k++) {
@@ -3111,6 +3131,7 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
 			}
 		} else {
 			/* Fallback: activate all at once */
+			t->msgQueueGain[t->msgQueueWriter - t->msgQueue] = t->nextKeyGain;
 			*t->msgQueueWriter++ = MSG_KEY_ON (keyNumber);
 			if (t->msgQueueWriter == t->msgQueueEnd) {
 				t->msgQueueWriter = t->msgQueue;
@@ -3118,6 +3139,7 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
 		}
 	} else {
 		/* Normal: all buses at once */
+		t->msgQueueGain[t->msgQueueWriter - t->msgQueue] = t->nextKeyGain;
 		*t->msgQueueWriter++ = MSG_KEY_ON (keyNumber);
 		if (t->msgQueueWriter == t->msgQueueEnd) {
 			t->msgQueueWriter = t->msgQueue;
@@ -3130,9 +3152,10 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
  * Only processes keyContrib entries where bus % 9 == targetBus.
  */
 static void
-activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus)
+activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus, float gain)
 {
 	ListElement* lep;
+	t->keyGain[keyNumber] = gain;
 	for (lep = t->keyContrib[keyNumber]; lep != NULL; lep = lep->next) {
 		int busNumber = LE_BUSNUMBER_OF (lep);
 		if ((busNumber % 9) != targetBus)
@@ -3151,7 +3174,7 @@ activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus)
 			osp->rflags |= ORF_MODIFIED;
 		}
 
-		t->aot[wheelNumber].busLevel[busNumber] += LE_LEVEL_OF (lep);
+		t->aot[wheelNumber].busLevel[busNumber] += LE_LEVEL_OF (lep) * gain;
 		t->aot[wheelNumber].keyCount[busNumber] += 1;
 		t->aot[wheelNumber].refCount += 1;
 	}
@@ -3172,7 +3195,7 @@ processPendingContacts (struct b_tonegen* t)
 				continue; /* already activated */
 			t->pendingContacts[i].busDelay[k] -= BUFFER_SIZE_SAMPLES;
 			if (t->pendingContacts[i].busDelay[k] <= 0) {
-				activateBusForKey (t, t->pendingContacts[i].keyNumber, k);
+				activateBusForKey (t, t->pendingContacts[i].keyNumber, k, t->pendingContacts[i].gain);
 				t->pendingContacts[i].busDelay[k] = -1;
 			} else {
 				allDone = 0;
@@ -3201,7 +3224,7 @@ cancelPendingContacts (struct b_tonegen* t, int keyNumber)
 			int k;
 			for (k = 0; k < 9; k++) {
 				if (t->pendingContacts[i].busDelay[k] >= 0) {
-					activateBusForKey (t, keyNumber, k);
+					activateBusForKey (t, keyNumber, k, t->pendingContacts[i].gain);
 				}
 			}
 			t->pendingContacts[i] = t->pendingContacts[--t->pendingContactCount];
@@ -3297,17 +3320,13 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	/* Reset the core program */
 	t->coreWriter = t->coreReader = t->corePgm;
 
-	/* Process serial contact pending activations */
-	if (t->serialContactEnabled && t->pendingContactCount > 0) {
-		processPendingContacts (t);
-	}
-
 	/* ****************************************************************
 	 *     M E S S S A G E   Q U E U E
 	 * ****************************************************************/
 
 	while (t->msgQueueReader != t->msgQueueWriter) {
-		unsigned short msg = *t->msgQueueReader++; /* Read next message */
+		const int      msgIndex = (int)(t->msgQueueReader - t->msgQueue);
+		unsigned short msg      = *t->msgQueueReader++; /* Read next message */
 		int            keyNumber;
 		ListElement*   lep;
 
@@ -3317,7 +3336,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 		}
 
 		if (MSG_GET_MSG (msg) == MSG_MKEYON) {
-			keyNumber = MSG_GET_PRM (msg);
+			keyNumber             = MSG_GET_PRM (msg);
+			t->keyGain[keyNumber] = t->msgQueueGain[msgIndex];
 			for (lep = t->keyContrib[keyNumber]; lep != NULL; lep = lep->next) {
 				int wheelNumber = LE_WHEEL_NUMBER_OF (lep);
 				osp             = &(t->oscillators[wheelNumber]);
@@ -3334,7 +3354,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 					osp->rflags |= ORF_MODIFIED;
 				}
 
-				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] += LE_LEVEL_OF (lep);
+				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] += LE_LEVEL_OF (lep) * t->keyGain[keyNumber];
 				t->aot[wheelNumber].keyCount[LE_BUSNUMBER_OF (lep)] += 1;
 				t->aot[wheelNumber].refCount += 1;
 			}
@@ -3345,7 +3365,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 				int wheelNumber = LE_WHEEL_NUMBER_OF (lep);
 				osp             = &(t->oscillators[wheelNumber]);
 
-				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] -= LE_LEVEL_OF (lep);
+				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] -= LE_LEVEL_OF (lep) * t->keyGain[keyNumber];
 				t->aot[wheelNumber].keyCount[LE_BUSNUMBER_OF (lep)] -= 1;
 				t->aot[wheelNumber].refCount -= 1;
 
@@ -3362,6 +3382,15 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			assert (0);
 		}
 	} /* while message queue reader */
+
+	/* Process serial contact pending activations. This runs after the
+	 * message queue on purpose: a retrigger queues KEY_OFF for the old
+	 * press and a pending entry for the new one, and the KEY_OFF must
+	 * subtract with the gain that was added before the new activation
+	 * overwrites keyGain[]. */
+	if (t->serialContactEnabled && t->pendingContactCount > 0) {
+		processPendingContacts (t);
+	}
 
 	/* ****************************************************************
 	 *     A C T I V A T E D   L I S T

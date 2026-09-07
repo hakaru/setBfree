@@ -195,6 +195,13 @@ struct b_tonegen {
 #define MSGQSZ 1024
 	unsigned short msgQueue[MSGQSZ]; /**< Message queue ringbuffer - MIDI->Synth */
 
+	/* Per-key gain (elepiano layer split). MSG_KEY_ON carries the gain in
+	 * msgQueueGain[] at the same index; keyGain[] remembers what was added
+	 * to the buses so that MSG_KEY_OFF subtracts exactly that. */
+	float msgQueueGain[MSGQSZ];
+	float keyGain[MAX_KEYS];
+	float nextKeyGain;
+
 	unsigned short* msgQueueWriter; /**< message-queue srite pointer */
 	unsigned short* msgQueueReader; /**< message-queue read pointer */
 	unsigned short* msgQueueEnd;
@@ -551,8 +558,9 @@ struct b_tonegen {
 #define MAX_PENDING_KEYS 64
 	unsigned char keyVelocity[MAX_KEYS];
 	struct {
-		int keyNumber;
-		int busDelay[9]; /* remaining samples per bus, -1 = done */
+		int   keyNumber;
+		int   busDelay[9]; /* remaining samples per bus, -1 = done */
+		float gain;        /* per-key gain captured at key-on */
 	} pendingContacts[MAX_PENDING_KEYS];
 	int    pendingContactCount;
 	double contactStaggerSlowMs;
@@ -586,6 +594,7 @@ extern void freeToneGenerator (struct b_tonegen* t);
 
 extern void oscKeyOff (struct b_tonegen* t, unsigned char midiNote, unsigned char realKey);
 extern void oscKeyOn (struct b_tonegen* t, unsigned char midiNote, unsigned char realKey, unsigned char velocity);
+extern void setNextKeyGain (struct b_tonegen* t, float gain);
 extern void setDrawBars (void* inst, unsigned int manual, unsigned int setting[]);
 extern void oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples);
 
