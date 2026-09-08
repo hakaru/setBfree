@@ -3065,6 +3065,7 @@ oscKeyOff (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey)
 		assert (0 <= t->keyDownCount);
 #endif /* KEYCOMPRESSION */
 		/* Write message saying that the key is released */
+		t->msgQueueGain[t->msgQueueWriter - t->msgQueue] = t->keyGain[keyNumber];
 		*t->msgQueueWriter++ = MSG_KEY_OFF (keyNumber);
 		/* Check for wrap on message queue */
 		if (t->msgQueueWriter == t->msgQueueEnd) {
@@ -3099,6 +3100,9 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
 	if (t->activeKeys[keyNumber] != 0) {
 		oscKeyOff (t, keyNumber, realKey);
 	}
+	/* The held press owns this gain. Capture it into KEY_OFF before a
+	 * later press can replace it, just as KEY_ON captures nextKeyGain. */
+	t->keyGain[keyNumber] = t->nextKeyGain;
 	/* Store velocity */
 	t->keyVelocity[keyNumber] = velocity;
 	/* Mark the key as active */
@@ -3157,7 +3161,6 @@ static void
 activateBusForKey (struct b_tonegen* t, int keyNumber, int targetBus, float gain)
 {
 	ListElement* lep;
-	t->keyGain[keyNumber] = gain;
 	for (lep = t->keyContrib[keyNumber]; lep != NULL; lep = lep->next) {
 		int busNumber = LE_BUSNUMBER_OF (lep);
 		if ((busNumber % 9) != targetBus)
@@ -3339,7 +3342,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 
 		if (MSG_GET_MSG (msg) == MSG_MKEYON) {
 			keyNumber             = MSG_GET_PRM (msg);
-			t->keyGain[keyNumber] = t->msgQueueGain[msgIndex];
+			const float gain      = t->msgQueueGain[msgIndex];
 			for (lep = t->keyContrib[keyNumber]; lep != NULL; lep = lep->next) {
 				int wheelNumber = LE_WHEEL_NUMBER_OF (lep);
 				osp             = &(t->oscillators[wheelNumber]);
@@ -3356,18 +3359,19 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 					osp->rflags |= ORF_MODIFIED;
 				}
 
-				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] += LE_LEVEL_OF (lep) * t->keyGain[keyNumber];
+				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] += LE_LEVEL_OF (lep) * gain;
 				t->aot[wheelNumber].keyCount[LE_BUSNUMBER_OF (lep)] += 1;
 				t->aot[wheelNumber].refCount += 1;
 			}
 
 		} else if (MSG_GET_MSG (msg) == MSG_MKEYOFF) {
 			keyNumber = MSG_GET_PRM (msg);
+			const float gain = t->msgQueueGain[msgIndex];
 			for (lep = t->keyContrib[keyNumber]; lep != NULL; lep = lep->next) {
 				int wheelNumber = LE_WHEEL_NUMBER_OF (lep);
 				osp             = &(t->oscillators[wheelNumber]);
 
-				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] -= LE_LEVEL_OF (lep) * t->keyGain[keyNumber];
+				t->aot[wheelNumber].busLevel[LE_BUSNUMBER_OF (lep)] -= LE_LEVEL_OF (lep) * gain;
 				t->aot[wheelNumber].keyCount[LE_BUSNUMBER_OF (lep)] -= 1;
 				t->aot[wheelNumber].refCount -= 1;
 
@@ -3385,11 +3389,9 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 		}
 	} /* while message queue reader */
 
-	/* Process serial contact pending activations. This runs after the
-	 * message queue on purpose: a retrigger queues KEY_OFF for the old
-	 * press and a pending entry for the new one, and the KEY_OFF must
-	 * subtract with the gain that was added before the new activation
-	 * overwrites keyGain[]. */
+	/* Finish queued releases before activating the new serial contacts.
+	 * Both KEY_ON and KEY_OFF carry their press's gain, so an early
+	 * cancelPendingContacts cannot change a queued release's subtraction. */
 	if (t->serialContactEnabled && t->pendingContactCount > 0) {
 		processPendingContacts (t);
 	}

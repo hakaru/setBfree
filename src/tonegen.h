@@ -195,9 +195,9 @@ struct b_tonegen {
 #define MSGQSZ 1024
 	unsigned short msgQueue[MSGQSZ]; /**< Message queue ringbuffer - MIDI->Synth */
 
-	/* Per-key gain (elepiano layer split). MSG_KEY_ON carries the gain in
-	 * msgQueueGain[] at the same index; keyGain[] remembers what was added
-	 * to the buses so that MSG_KEY_OFF subtracts exactly that. */
+	/* Per-key gain (elepiano layer split). Both MSG_KEY_ON and MSG_KEY_OFF
+	 * carry their press's gain in msgQueueGain[]. keyGain[] belongs to the
+	 * currently held press; bus activation must not change it. */
 	float msgQueueGain[MSGQSZ];
 	float keyGain[MAX_KEYS];
 	float nextKeyGain;
