@@ -1879,13 +1879,15 @@ setClickFromMIDI (void* d, unsigned char v)
 
 /**
  * MIDI CC handler: set generator leakage from CC value 0-127.
- * Maps 0 = clean, 127 = max leakage (0.02 gain).
+ * Maps 0 = clean, 127 = max leakage. The original 0.02 gain put the idle-wheel
+ * hum at the level of a played note at CC 127 (elepiano: RMS 0.024 vs 0.075 for
+ * a single C5); in practice CC 10 was plenty, so the range is scaled to that.
  */
 static void
 setLeakageFromMIDI (void* d, unsigned char v)
 {
 	struct b_tonegen* t = (struct b_tonegen*)d;
-	t->leakageGain = ((float)v / 127.0f) * 0.02f;
+	t->leakageGain = ((float)v / 127.0f) * (0.02f * 10.0f / 127.0f);
 }
 
 /**
