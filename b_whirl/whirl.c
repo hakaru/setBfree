@@ -533,6 +533,27 @@ zeroBuffers (struct b_whirl* w)
 	memset (w->adx2, 0, sizeof (float) * AGBUF);
 }
 
+/* Clear the signal history (delay lines, filter states) but keep every
+ * parameter, table and rotor position. elepiano calls this from the audio
+ * thread when a non-finite sample was found in the Leslie output, so that a
+ * poisoned IIR state cannot keep the organ silent until relaunch. */
+void
+whirlResetState (struct b_whirl* w)
+{
+	int i;
+	zeroBuffers (w);
+	for (i = 0; i < 4; ++i)
+		w->z[i] = 0;
+	w->drfL[z0] = w->drfL[z1] = 0;
+	w->drfR[z0] = w->drfR[z1] = 0;
+	w->hafw[z0] = w->hafw[z1] = 0;
+	w->hbfw[z0] = w->hbfw[z1] = 0;
+#ifdef HORN_COMB_FILTER
+	memset (w->comb0, 0, sizeof (float) * COMB_SIZE);
+	memset (w->comb1, 0, sizeof (float) * COMB_SIZE);
+#endif
+}
+
 void
 computeOffsets (struct b_whirl* w)
 {
