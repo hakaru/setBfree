@@ -3305,7 +3305,12 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	float* const          prcBuffer   = t->prcBuffer;
 
 #ifdef KEYCOMPRESSION
-	const float keyComp      = t->keyCompTable[t->keyDownCount];
+	/* All three manuals can hold more keys than the legacy compression
+	 * curve covers (154 mapped keys, MAX_KEYS storage slots). Keep the
+	 * existing curve and saturate at its last gain instead of reading
+	 * keyDownCount / corePgm as float data past the table. */
+	const int keyCompIndex   = t->keyDownCount < MAXKEYS ? t->keyDownCount : MAXKEYS - 1;
+	const float keyComp      = t->keyCompTable[keyCompIndex];
 	const float keyCompDelta = (keyComp - t->keyCompLevel) / (float)BUFFER_SIZE_SAMPLES;
 #define KEYCOMPCHASE()                           \
 	{                                        \
@@ -3460,6 +3465,10 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			} else {
 				t->coreWriter->cnt = BUFFER_SIZE_SAMPLES;
 				osp->pos += BUFFER_SIZE_SAMPLES;
+				/* Leakage may read this oscillator after its final release
+				 * in this same fragment. Keep the next position in range. */
+				if (osp->pos == osp->lengthSamples)
+					osp->pos = 0;
 			}
 
 			t->coreWriter += 1;
@@ -3590,6 +3599,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			} else {
 				t->coreWriter->cnt = BUFFER_SIZE_SAMPLES;
 				osp->pos += BUFFER_SIZE_SAMPLES;
+				if (osp->pos == osp->lengthSamples)
+					osp->pos = 0;
 			}
 
 			t->coreWriter += 1; /* Advance to next instruction */
