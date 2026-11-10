@@ -566,6 +566,8 @@ struct b_tonegen {
 	float        wheelDriftTarget[NOF_WHEELS + 1];
 	int          wheelDriftCountdown[NOF_WHEELS + 1]; /* fragments until a new target */
 	unsigned int agingRng;
+	short        agingNeighbour[NOF_WHEELS + 1][2]; /* wheels that bleed into this one's pickup; 0 = none */
+	float        agingBleed[NOF_WHEELS + 1];        /* scratch: extra level of each idle wheel this fragment */
 	int          agingWasActive;
 
 	/* Serial contact switching (velocity-dependent staggered bus activation) */

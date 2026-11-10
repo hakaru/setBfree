@@ -1870,6 +1870,7 @@ static void initEnvelopes (struct b_tonegen* t);
 #define AGING_TRIM_DB 1.5f  /* fixed per-wheel level spread at aging 1.0 */
 #define AGING_ROT_DB 0.5f   /* once-per-revolution wobble */
 #define AGING_DRIFT_DB 0.8f /* slow irregular wobble */
+#define AGING_CROSSTALK 0.06f /* extra neighbour-wheel bleed at aging 1.0 */
 
 static unsigned int
 agingNext (struct b_tonegen* t)
@@ -1923,6 +1924,18 @@ initAging (struct b_tonegen* t)
 		t->wheelDriftCountdown[w] = 1 + (int)(agingNext (t) % 64u);
 	}
 	t->agingWasActive = 0;
+	/* Neighbours for the aging crosstalk: the wheel sharing the compartment and
+	 * the next terminal on the strip. Same relations applyDefaultConfiguration uses. */
+	for (w = 0; w <= NOF_WHEELS; w++) {
+		int east = 0, west = 0;
+		t->agingBleed[w]         = 0.0f;
+		t->agingNeighbour[w][0]  = (w > 0 && 0 < wheelPairs[w]) ? wheelPairs[w] : 0;
+		t->agingNeighbour[w][1]  = 0;
+		if (w > 0) {
+			findEastWestNeighbours (terminalStrip, w, &east, &west);
+			t->agingNeighbour[w][1] = (short)((0 < east) ? east : west);
+		}
+	}
 }
 
 /* Advance every wheel by one fragment. Runs only while aging is (or just was) on. */
@@ -3832,17 +3845,53 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	 *      G E N E R A T O R   L E A K A G E
 	 * ****************************************************************/
 
-	if (t->leakageGain > 0.0f) {
+	/* elepiano: aging raises the bleed of each sounding wheel's neighbours. The
+	 * extra level rides on the same loop as the leakage so an idle wheel's read
+	 * position advances once per fragment. */
+	const int agingBleeds = (t->agingFactor > 0.0f);
+	if (agingBleeds) {
+		int a;
+		for (a = 1; a <= NOF_WHEELS; a++)
+			t->agingBleed[a] = 0.0f;
+		for (a = 0; a < t->activeOscLEnd; a++) {
+			const int   src = t->activeOscList[a];
+			const float lvl = t->agingFactor * AGING_CROSSTALK * (t->aot[src].sumSwell + t->aot[src].sumScanr);
+			int         k;
+			for (k = 0; k < 2; k++) {
+				const int n = t->agingNeighbour[src][k];
+				if (0 < n)
+					t->agingBleed[n] += lvl;
+			}
+		}
+	}
+
+	if (t->leakageGain > 0.0f || agingBleeds) {
 		int w;
-		const float lg = t->leakageGain;
 		for (w = 1; w <= NOF_WHEELS; w++) {
-			if (t->aot[w].refCount > 0)
-				continue; /* skip active oscillators */
 			struct _oscillator* o = &(t->oscillators[w]);
+			size_t              pos;
+			int                 s;
+			if (t->aot[w].refCount > 0) {
+				/* A sounding wheel (possibly only through the configured crosstalk).
+				 * The core already advanced its position this fragment, so read the
+				 * same samples again and leave the position alone. Leakage skips it. */
+				const float bg = agingBleeds ? t->agingBleed[w] : 0.0f;
+				if (bg <= 0.0f || o->wave == NULL || o->lengthSamples == 0)
+					continue;
+				pos = (o->pos + o->lengthSamples - (BUFFER_SIZE_SAMPLES % o->lengthSamples)) % o->lengthSamples;
+				for (s = 0; s < BUFFER_SIZE_SAMPLES; s++) {
+					swlBuffer[s] += o->wave[pos] * bg;
+					if (++pos >= o->lengthSamples)
+						pos = 0;
+				}
+				continue;
+			}
+			const float lg = agingBleeds ? (t->leakageGain + t->agingBleed[w]) : t->leakageGain;
+			if (lg <= 0.0f)
+				continue;
 			if (o->wave == NULL || o->lengthSamples == 0)
 				continue;
-			size_t pos = o->pos;
-			int    s;
+			pos = o->pos;
 			for (s = 0; s < BUFFER_SIZE_SAMPLES; s++) {
 				swlBuffer[s] += o->wave[pos] * lg;
 				if (++pos >= o->lengthSamples)
