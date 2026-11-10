@@ -181,6 +181,23 @@ setVibratoUpperFromMIDI (void* t, unsigned char uc)
 	notifyControlChangeByName (inst_synth->midi_cfg_ptr, "vibrato.routing", getVibratoRouting (inst_synth) << 5);
 }
 
+/*
+ * elepiano: continuous depth on top of the V1..C3 selection.
+ * CC 64 is exactly the configured depth, 0 is half, 127 is double.
+ */
+static void
+setVibratoDepthFromMIDI (void* t, unsigned char uc)
+{
+	struct b_vibrato* v = &(((struct b_tonegen*)t)->inst_vibrato);
+	if (uc == 64) {
+		v->depthTargetQ16 = 65536;
+	} else if (uc < 64) {
+		v->depthTargetQ16 = 32768 + (unsigned int)uc * 512; /* 0.5 .. 1.0 */
+	} else {
+		v->depthTargetQ16 = 65536 + ((unsigned int)(uc - 64) * 65536) / 63; /* 1.0 .. 2.0 */
+	}
+}
+
 static void
 setVibratoLowerFromMIDI (void* t, unsigned char uc)
 {
@@ -265,6 +282,7 @@ reset_vibrato (struct b_vibrato* v)
 	v->statorIncrement = 0;
 
 	v->outPos = BUF_MASK_SAMPLES / 2;
+	v->depthQ16 = v->depthTargetQ16 = 65536;
 
 	v->vib1OffAmp = 3.0;
 	v->vib2OffAmp = 6.0;
@@ -297,6 +315,7 @@ initVibrato (void* t, void* m)
 	struct b_vibrato* v = &(((struct b_tonegen*)t)->inst_vibrato);
 	init_vibrato (v);
 	useMIDIControlFunction (m, "vibrato.knob", setVibratoFromMIDI, t);
+	useMIDIControlFunction (m, "vibrato.depth", setVibratoDepthFromMIDI, t);
 	useMIDIControlFunction (m, "vibrato.routing", setVibratoRoutingFromMIDI, t);
 	useMIDIControlFunction (m, "vibrato.upper", setVibratoUpperFromMIDI, t);
 	useMIDIControlFunction (m, "vibrato.lower", setVibratoLowerFromMIDI, t);
@@ -351,8 +370,19 @@ vibratoProc (struct b_vibrato* v, float const* inbuffer, float* outbuffer, size_
 		const float x = *xp++;
 		/* Determine the fixed point writing position. This is relative to */
 		/* the current output position (outpos). */
-		const unsigned int j =
-		    ((v->outPos << 16) + v->offsetTable[v->stator >> 16]) & BUF_MASK_POSN;
+		unsigned int offset = v->offsetTable[v->stator >> 16];
+		if (v->depthQ16 != 65536 || v->depthTargetQ16 != 65536) {
+			/* The tables hold 1 + amp + amp*sin (in samples, Q16). Scale the part
+			 * above one sample so the writer never falls behind the reader. The
+			 * slew (8/65536 per sample) keeps a sweep from stepping the delay. */
+			if (v->depthQ16 < v->depthTargetQ16) {
+				v->depthQ16 = (v->depthTargetQ16 - v->depthQ16 > 8) ? v->depthQ16 + 8 : v->depthTargetQ16;
+			} else if (v->depthQ16 > v->depthTargetQ16) {
+				v->depthQ16 = (v->depthQ16 - v->depthTargetQ16 > 8) ? v->depthQ16 - 8 : v->depthTargetQ16;
+			}
+			offset = 65536u + (unsigned int)(((unsigned long long)(offset - 65536u) * v->depthQ16) >> 16);
+		}
+		const unsigned int j = ((v->outPos << 16) + offset) & BUF_MASK_POSN;
 		/* Convert fixpoint writing position to integer sample */
 		const int h = j >> 16;
 		/* And the following sample, possibly wrapping the delay buffer. */

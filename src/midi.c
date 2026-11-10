@@ -108,6 +108,7 @@ static const char* ccFuncNames[] = {
 	"vibrato.routing", /* off/lower/upper/both */
 	"vibrato.upper",   /* off/on */
 	"vibrato.lower",   /* off/on */
+	"vibrato.depth",   /* elepiano: continuous depth, 64 = configured */
 
 	"swellpedal1", /* Volume, for primary controller */
 	"swellpedal2", /* Volume, for secondary controller */
@@ -997,6 +998,7 @@ midiPrimeControllerMapping (void* mcfg)
 	loadCCMap (m, "vibrato.knob", 92, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "vibrato.lower", 30, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "vibrato.upper", 31, m->ctrlUseA, NULL, NULL);
+	loadCCMap (m, "vibrato.depth", 57, m->ctrlUseA, NULL, NULL);
 
 	loadCCMap (m, "overdrive.enable", 65, m->ctrlUseA, m->ctrlUseB, m->ctrlUseC);
 	loadCCMap (m, "overdrive.character", 93, m->ctrlUseA, NULL, NULL);

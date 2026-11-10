@@ -47,6 +47,11 @@ struct b_vibrato {
 
 	unsigned int outPos;
 
+	/* elepiano: vibrato.depth scales the excursion of the offset tables.
+	 * Q16, 65536 = the configured depth. depthQ16 slews toward the target. */
+	unsigned int depthQ16;
+	unsigned int depthTargetQ16;
+
 	float vibBuffer[BUF_SIZE_BYTES];
 
 	/*
