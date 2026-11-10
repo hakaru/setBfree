@@ -1969,7 +1969,14 @@ agingAdvance (struct b_tonegen* t)
 		          AGING_DRIFT_DB * t->wheelDrift[w]);
 		t->wheelLive[w] = (a > 0.0f) ? expf (dB * 0.115129255f) : 1.0f;
 	}
-	t->agingWasActive = (a > 0.0f);
+	/* After aging returns to 0 this must run twice: once to ramp every wheel to
+	 * 1.0, once more so wheelLivePrev is 1.0 too. Stopping after the first leaves
+	 * prev at the old gain and every later fragment ramps old -> 1.0 again. */
+	if (a > 0.0f) {
+		t->agingWasActive = 2;
+	} else if (t->agingWasActive > 0) {
+		t->agingWasActive--;
+	}
 }
 
 

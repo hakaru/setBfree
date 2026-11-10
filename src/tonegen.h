@@ -582,7 +582,7 @@ struct b_tonegen {
 	} clickBurst[8];
 	short        agingNeighbour[NOF_WHEELS + 1][2]; /* wheels that bleed into this one's pickup; 0 = none */
 	float        agingBleed[NOF_WHEELS + 1];        /* scratch: extra level of each idle wheel this fragment */
-	int          agingWasActive;
+	int          agingWasActive; /* fragments agingAdvance still has to run after aging hit 0 */
 
 	/* Serial contact switching (velocity-dependent staggered bus activation) */
 #define MAX_PENDING_KEYS 64
