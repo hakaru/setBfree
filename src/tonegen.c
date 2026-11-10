@@ -337,6 +337,8 @@ initValues (struct b_tonegen* t)
 	t->leakageGain = 0.0f;
 	t->agingFactor = 0.0f;
 	t->agingWasActive = 0;
+	t->roughDb        = 0.0f;
+	t->roughNormDb    = 0.0f;
 	t->agingRng       = 0xB3A61A01u;
 	t->percLevelScale = 1.0f;
 	t->clickExtra         = 0.0f;
@@ -1883,6 +1885,9 @@ static void initLinearReleaseEnvelope (struct b_tonegen* t, int b);
 #define AGING_ROT_DB 0.8f   /* once-per-revolution wobble */
 #define AGING_DRIFT_DB 3.0f /* slow irregular wobble */
 #define AGING_CROSSTALK 0.12f /* extra neighbour-wheel bleed at aging 1.0 */
+/* elepiano: the roughness control (CC 59) drives the once-per-revolution term
+ * on its own, on top of whatever aging adds. 16-31 Hz AM on every wheel. */
+#define ROUGH_DB 6.0f /* peak level swing at roughness 1.0 */
 
 static unsigned int
 agingNext (struct b_tonegen* t)
@@ -1955,6 +1960,8 @@ static void
 agingAdvance (struct b_tonegen* t)
 {
 	const float a          = t->agingFactor;
+	const float rough      = t->roughDb;
+	const int   on         = (a > 0.0f || rough > 0.0f);
 	const float fragSec    = (float)((double)BUFFER_SIZE_SAMPLES / SampleRateD);
 	const float driftCoeff = 1.0f - expf (-fragSec / 0.3f);
 	int         w;
@@ -1973,12 +1980,14 @@ agingAdvance (struct b_tonegen* t)
 		t->wheelDrift[w] += driftCoeff * (t->wheelDriftTarget[w] - t->wheelDrift[w]);
 		dB = a * (AGING_TRIM_DB * t->wheelTrimUnit[w] + AGING_ROT_DB * sinf (t->wheelRotPhase[w]) +
 		          AGING_DRIFT_DB * t->wheelDrift[w]);
-		t->wheelLive[w] = (a > 0.0f) ? expf (dB * 0.115129255f) : 1.0f;
+		if (rough > 0.0f)
+			dB += rough * sinf (t->wheelRotPhase[w]) + t->roughNormDb;
+		t->wheelLive[w] = on ? expf (dB * 0.115129255f) : 1.0f;
 	}
 	/* After aging returns to 0 this must run twice: once to ramp every wheel to
 	 * 1.0, once more so wheelLivePrev is 1.0 too. Stopping after the first leaves
 	 * prev at the old gain and every later fragment ramps old -> 1.0 again. */
-	if (a > 0.0f) {
+	if (on) {
 		t->agingWasActive = 2;
 	} else if (t->agingWasActive > 0) {
 		t->agingWasActive--;
@@ -2156,6 +2165,22 @@ setLeakageFromMIDI (void* d, unsigned char v)
 {
 	struct b_tonegen* t = (struct b_tonegen*)d;
 	t->leakageGain = ((float)v / 127.0f) * (0.02f * 10.0f / 127.0f);
+}
+
+/**
+ * elepiano: roughness, the once-per-revolution level swing of every wheel.
+ * CC 0 = off (and byte-identical), 127 = +/- ROUGH_DB. Works without aging.
+ */
+static void
+setRoughFromMIDI (void* d, unsigned char v)
+{
+	struct b_tonegen* t = (struct b_tonegen*)d;
+	const float       k = ((float)v / 127.0f) * ROUGH_DB * 0.115129255f; /* peak swing in nepers */
+	const float       x = 2.0f * k;
+	/* The mean power of exp(k sin) is I0(2k); take it back out so the level stays put. */
+	const float i0 = 1.0f + (x * x) / 4.0f + (x * x * x * x) / 64.0f + (x * x * x * x * x * x) / 2304.0f;
+	t->roughDb     = ((float)v / 127.0f) * ROUGH_DB;
+	t->roughNormDb = -10.0f * log10f (i0);
 }
 
 /**
@@ -3320,6 +3345,7 @@ initToneGenerator (struct b_tonegen* t, void* m)
 	useMIDIControlFunction (m, "osc.click.release", setReleaseClickFromMIDI, t);
 	useMIDIControlFunction (m, "osc.leakage", setLeakageFromMIDI, t);
 	useMIDIControlFunction (m, "osc.tone.aging", setAgingFromMIDI, t);
+	useMIDIControlFunction (m, "osc.tone.rough", setRoughFromMIDI, t);
 
 #if DEBUG_TONEGEN_OSC
 	dumpOscToText (t, "osc.txt");
@@ -3726,7 +3752,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	}
 
 	/* elepiano: aging wobble. Skipped entirely while aging is 0 (wheelLive stays 1.0). */
-	if (t->agingFactor > 0.0f || t->agingWasActive) {
+	if (t->agingFactor > 0.0f || t->roughDb > 0.0f || t->agingWasActive) {
 		agingAdvance (t);
 	}
 

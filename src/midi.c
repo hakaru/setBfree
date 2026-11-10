@@ -167,6 +167,7 @@ static const char* ccFuncNames[] = {
 	"osc.click.release", /* elepiano: release click amount, 64 = configured */
 	"osc.leakage",
 	"osc.tone.aging",
+	"osc.tone.rough", /* elepiano: revolution-rate roughness, 0 = off */
 
 	NULL
 };
@@ -1014,6 +1015,7 @@ midiPrimeControllerMapping (void* mcfg)
 	loadCCMap (m, "osc.click.release", 58, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "osc.leakage",     22, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "osc.tone.aging",  23, m->ctrlUseA, NULL, NULL);
+	loadCCMap (m, "osc.tone.rough",  59, m->ctrlUseA, NULL, NULL);
 }
 
 /*

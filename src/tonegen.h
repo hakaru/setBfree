@@ -567,6 +567,8 @@ struct b_tonegen {
 	int          wheelDriftCountdown[NOF_WHEELS + 1]; /* fragments until a new target */
 	unsigned int agingRng;
 	float        percLevelScale; /* elepiano: percussion.level, 1.0 at CC 64 */
+	float        roughDb;        /* elepiano: osc.tone.rough, peak dB of the revolution-rate swing */
+	float        roughNormDb;    /* level correction that keeps the mean power at roughDb */
 	/* elepiano: click CC above 96 adds an attack noise layer; 0..96 blends the
 	 * release from the configured linear ramp to the click release. */
 	float        clickExtra;      /* 0 at CC <= 96, 1 at CC 127 */
