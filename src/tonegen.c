@@ -337,8 +337,8 @@ initValues (struct b_tonegen* t)
 	t->leakageGain = 0.0f;
 	t->agingFactor = 0.0f;
 	t->agingWasActive = 0;
-	t->roughDb        = 0.0f;
-	t->roughNormDb    = 0.0f;
+	t->roughDepth     = 0.0f;
+	t->roughNorm      = 1.0f;
 	t->agingRng       = 0xB3A61A01u;
 	t->percLevelScale = 1.0f;
 	t->clickExtra         = 0.0f;
@@ -1885,9 +1885,15 @@ static void initLinearReleaseEnvelope (struct b_tonegen* t, int b);
 #define AGING_ROT_DB 0.8f   /* once-per-revolution wobble */
 #define AGING_DRIFT_DB 3.0f /* slow irregular wobble */
 #define AGING_CROSSTALK 0.12f /* extra neighbour-wheel bleed at aging 1.0 */
-/* elepiano: the roughness control (CC 59) drives the once-per-revolution term
- * on its own, on top of whatever aging adds. 16-31 Hz AM on every wheel. */
-#define ROUGH_DB 6.0f /* peak level swing at roughness 1.0 */
+/* elepiano: the roughness control (CC 59). A wheel's level follows a fixed
+ * pattern around each revolution (uneven teeth). Only harmonics 3..5 of the
+ * revolution rate are used, about 50-155 Hz: once per revolution (16-31 Hz)
+ * is heard as tremolo, not as roughness (listening, 2026-11-11). */
+/* Linear AM (1 + depth * pattern): an exponential (dB) swing mixes the three
+ * harmonics and puts their differences back at 1x and 2x the revolution rate.
+ * The pattern peaks at sqrt(3), so 0.55 keeps the gain above zero. */
+#define ROUGH_DEPTH 0.55f /* modulation depth at roughness 1.0 */
+#define ROUGH_FIRST_HARMONIC 3
 
 static unsigned int
 agingNext (struct b_tonegen* t)
@@ -1941,6 +1947,29 @@ initAging (struct b_tonegen* t)
 		t->wheelDriftCountdown[w] = 1 + (int)(agingNext (t) % 64u);
 	}
 	t->agingWasActive = 0;
+	/* Roughness pattern: three harmonics with random weights and phases per
+	 * wheel, scaled so the pattern has the power of a unit sine. Own generator,
+	 * so the aging values above stay what they were. */
+	{
+		unsigned int x = 0x7E37A905u;
+		for (w = 0; w <= NOF_WHEELS; w++) {
+			int   h;
+			float power = 0.0f;
+			for (h = 0; h < 3; h++) {
+				x ^= x << 13;
+				x ^= x >> 17;
+				x ^= x << 5;
+				t->wheelRoughAmp[w][h] = 0.5f + 0.5f * (float)(x >> 8) / 16777216.0f;
+				x ^= x << 13;
+				x ^= x >> 17;
+				x ^= x << 5;
+				t->wheelRoughPhase[w][h] = 6.283185307f * (float)(x >> 8) / 16777216.0f;
+				power += t->wheelRoughAmp[w][h] * t->wheelRoughAmp[w][h];
+			}
+			for (h = 0; h < 3; h++)
+				t->wheelRoughAmp[w][h] /= sqrtf (power);
+		}
+	}
 	/* Neighbours for the aging crosstalk: the wheel sharing the compartment and
 	 * the next terminal on the strip. Same relations applyDefaultConfiguration uses. */
 	for (w = 0; w <= NOF_WHEELS; w++) {
@@ -1960,13 +1989,14 @@ static void
 agingAdvance (struct b_tonegen* t)
 {
 	const float a          = t->agingFactor;
-	const float rough      = t->roughDb;
+	const float rough      = t->roughDepth;
 	const int   on         = (a > 0.0f || rough > 0.0f);
 	const float fragSec    = (float)((double)BUFFER_SIZE_SAMPLES / SampleRateD);
 	const float driftCoeff = 1.0f - expf (-fragSec / 0.3f);
 	int         w;
 	for (w = 1; w <= NOF_WHEELS; w++) {
 		float dB;
+		float roughGain     = 1.0f;
 		t->wheelLivePrev[w] = t->wheelLive[w];
 		t->wheelRotPhase[w] += t->wheelRotInc[w];
 		if (t->wheelRotPhase[w] > 6.283185307f)
@@ -1980,9 +2010,15 @@ agingAdvance (struct b_tonegen* t)
 		t->wheelDrift[w] += driftCoeff * (t->wheelDriftTarget[w] - t->wheelDrift[w]);
 		dB = a * (AGING_TRIM_DB * t->wheelTrimUnit[w] + AGING_ROT_DB * sinf (t->wheelRotPhase[w]) +
 		          AGING_DRIFT_DB * t->wheelDrift[w]);
-		if (rough > 0.0f)
-			dB += rough * sinf (t->wheelRotPhase[w]) + t->roughNormDb;
-		t->wheelLive[w] = on ? expf (dB * 0.115129255f) : 1.0f;
+		if (rough > 0.0f) {
+			int   h;
+			float pattern = 0.0f;
+			for (h = 0; h < 3; h++)
+				pattern += t->wheelRoughAmp[w][h] *
+				           sinf ((float)(ROUGH_FIRST_HARMONIC + h) * t->wheelRotPhase[w] + t->wheelRoughPhase[w][h]);
+			roughGain = (1.0f + rough * pattern) * t->roughNorm;
+		}
+		t->wheelLive[w] = on ? expf (dB * 0.115129255f) * roughGain : 1.0f;
 	}
 	/* After aging returns to 0 this must run twice: once to ramp every wheel to
 	 * 1.0, once more so wheelLivePrev is 1.0 too. Stopping after the first leaves
@@ -2168,19 +2204,18 @@ setLeakageFromMIDI (void* d, unsigned char v)
 }
 
 /**
- * elepiano: roughness, the once-per-revolution level swing of every wheel.
- * CC 0 = off (and byte-identical), 127 = +/- ROUGH_DB. Works without aging.
+ * elepiano: roughness, a fast level pattern locked to each wheel's revolution.
+ * CC 0 = off (and byte-identical), 127 = ROUGH_DEPTH. Works without aging.
  */
 static void
 setRoughFromMIDI (void* d, unsigned char v)
 {
 	struct b_tonegen* t = (struct b_tonegen*)d;
-	const float       k = ((float)v / 127.0f) * ROUGH_DB * 0.115129255f; /* peak swing in nepers */
-	const float       x = 2.0f * k;
-	/* The mean power of exp(k sin) is I0(2k); take it back out so the level stays put. */
-	const float i0 = 1.0f + (x * x) / 4.0f + (x * x * x * x) / 64.0f + (x * x * x * x * x * x) / 2304.0f;
-	t->roughDb     = ((float)v / 127.0f) * ROUGH_DB;
-	t->roughNormDb = -10.0f * log10f (i0);
+	const float       m = ((float)v / 127.0f) * ROUGH_DEPTH;
+	/* The pattern has the power of a unit sine (1/2), so the mean power of
+	 * (1 + m * pattern) is 1 + m^2 / 2; take it back out so the level stays put. */
+	t->roughDepth = m;
+	t->roughNorm  = 1.0f / sqrtf (1.0f + 0.5f * m * m);
 }
 
 /**
@@ -3752,7 +3787,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	}
 
 	/* elepiano: aging wobble. Skipped entirely while aging is 0 (wheelLive stays 1.0). */
-	if (t->agingFactor > 0.0f || t->roughDb > 0.0f || t->agingWasActive) {
+	if (t->agingFactor > 0.0f || t->roughDepth > 0.0f || t->agingWasActive) {
 		agingAdvance (t);
 	}
 
