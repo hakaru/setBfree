@@ -567,6 +567,19 @@ struct b_tonegen {
 	int          wheelDriftCountdown[NOF_WHEELS + 1]; /* fragments until a new target */
 	unsigned int agingRng;
 	float        percLevelScale; /* elepiano: percussion.level, 1.0 at CC 64 */
+	/* elepiano: click CC above 96 adds an attack noise layer; 0..96 blends the
+	 * release from the configured linear ramp to the click release. */
+	float        clickExtra;      /* 0 at CC <= 96, 1 at CC 127 */
+	float        releaseClickMix; /* 0 = configured release, 1 = click release */
+	int          clickBaseMaxLength; /* envAtkClkMaxLength before the CC stretched it, -1 = not captured */
+	unsigned int clickRng;
+	float        clickLpCoeff;
+	float        clickDecay;
+	struct {
+		float env;  /* 0 = free */
+		float lp;
+		float gain;
+	} clickBurst[8];
 	short        agingNeighbour[NOF_WHEELS + 1][2]; /* wheels that bleed into this one's pickup; 0 = none */
 	float        agingBleed[NOF_WHEELS + 1];        /* scratch: extra level of each idle wheel this fragment */
 	int          agingWasActive;

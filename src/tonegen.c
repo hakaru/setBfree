@@ -339,6 +339,11 @@ initValues (struct b_tonegen* t)
 	t->agingWasActive = 0;
 	t->agingRng       = 0xB3A61A01u;
 	t->percLevelScale = 1.0f;
+	t->clickExtra         = 0.0f;
+	t->releaseClickMix    = 1.0f; /* matches the default click CC 96 */
+	t->clickBaseMaxLength = -1;
+	t->clickRng           = 0xC11C4B3Fu;
+	memset (t->clickBurst, 0, sizeof (t->clickBurst));
 	{
 		int j;
 		for (j = 0; j <= NOF_WHEELS; j++)
@@ -1972,13 +1977,127 @@ agingAdvance (struct b_tonegen* t)
  * MIDI CC handler: set key-click level from CC value 0-127.
  * Updates both attack and release click levels and regenerates envelopes.
  */
+#define CLICK_KNEE 96           /* CC value where the attack layer starts */
+#define CLICK_LAYER_GAIN 25.0f  /* attack noise at CC 127 with every drawbar out */
+#define CLICK_RELEASE_GAIN 4.5f /* release noise at CC >= 96 with every drawbar out */
+#define CLICK_LAYER_MS 4.0f     /* decay time constant of one burst */
+#define CLICK_LAYER_HZ 4000.0f  /* one-pole low-pass on the noise */
+#define CLICK_LAYER_STACK 3.0f  /* simultaneous bursts never exceed this many */
+
+static unsigned int
+clickNext (struct b_tonegen* t)
+{
+	unsigned int x = t->clickRng;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	t->clickRng = x;
+	return x;
+}
+
+static void
+initClickLayer (struct b_tonegen* t)
+{
+	t->clickLpCoeff = 1.0f - expf (-6.2831853f * CLICK_LAYER_HZ / (float)SampleRateD);
+	t->clickDecay   = expf (-1.0f / (CLICK_LAYER_MS * 0.001f * (float)SampleRateD));
+	memset (t->clickBurst, 0, sizeof (t->clickBurst));
+}
+
+/* Start one contact-noise burst for a key. amount is the level with every
+ * drawbar of the key's manual pulled out; no drawbar, no click. */
+static void
+clickLayerBurst (struct b_tonegen* t, int keyNumber, float keyGain, float amount)
+{
+	int   lo, end, b, slot = 0;
+	float have = 0.0f, full = 0.0f, stacked = 0.0f, gain, weakest = 2.0f;
+	if (amount <= 0.0f)
+		return;
+	if (keyNumber < 64) {
+		lo  = UPPER_BUS_LO;
+		end = UPPER_BUS_END;
+	} else if (keyNumber < 128) {
+		lo  = LOWER_BUS_LO;
+		end = LOWER_BUS_END;
+	} else {
+		lo  = PEDAL_BUS_LO;
+		end = PEDAL_BUS_END;
+	}
+	for (b = lo; b < end; b++) {
+		have += t->drawBarGain[b];
+		full += t->drawBarLevel[b][8];
+	}
+	if (have <= 0.0f || full <= 0.0f)
+		return;
+	gain = amount * (have / full) * keyGain;
+	for (b = 0; b < 8; b++) {
+		stacked += t->clickBurst[b].gain * t->clickBurst[b].env;
+		if (t->clickBurst[b].env < weakest) {
+			weakest = t->clickBurst[b].env;
+			slot    = b;
+		}
+	}
+	if (stacked + gain > CLICK_LAYER_STACK * gain)
+		gain = CLICK_LAYER_STACK * gain - stacked;
+	if (gain <= 0.0f)
+		return;
+	t->clickBurst[slot].env  = 1.0f;
+	t->clickBurst[slot].lp   = 0.0f;
+	t->clickBurst[slot].gain = gain;
+}
+
+/* Key down: only above CC 96. */
+static void
+clickLayerKeyOn (struct b_tonegen* t, int keyNumber, float keyGain)
+{
+	clickLayerBurst (t, keyNumber, keyGain, CLICK_LAYER_GAIN * t->clickExtra * t->clickExtra);
+}
+
+/* Key up: follows CC 0..96 and stays there above. */
+static void
+clickLayerKeyOff (struct b_tonegen* t, int keyNumber, float keyGain)
+{
+	clickLayerBurst (t, keyNumber, keyGain, CLICK_RELEASE_GAIN * t->releaseClickMix * t->releaseClickMix);
+}
+
+/* Adds the live bursts to the swell buffer (so the swell pedal scales them). */
+static void
+clickLayerRender (struct b_tonegen* t, float* swl)
+{
+	int b, s;
+	for (b = 0; b < 8; b++) {
+		float env = t->clickBurst[b].env;
+		float lp  = t->clickBurst[b].lp;
+		if (env <= 0.0f)
+			continue;
+		for (s = 0; s < BUFFER_SIZE_SAMPLES; s++) {
+			const float n = ((float)(clickNext (t) >> 8) / 8388608.0f) - 1.0f;
+			lp += t->clickLpCoeff * (n - lp);
+			swl[s] += lp * env * t->clickBurst[b].gain;
+			env *= t->clickDecay;
+		}
+		t->clickBurst[b].env = (env < 1e-4f) ? 0.0f : env;
+		t->clickBurst[b].lp  = lp;
+	}
+}
+
 static void
 setClickFromMIDI (void* d, unsigned char v)
 {
-	struct b_tonegen* t = (struct b_tonegen*)d;
-	float norm = (float)v / 127.0f;
-	t->envAttackClickLevel  = norm;
-	t->envReleaseClickLevel = norm * 0.53f;
+	struct b_tonegen* t      = (struct b_tonegen*)d;
+	const int         capped = (v > CLICK_KNEE) ? CLICK_KNEE : v;
+	const float       extra  = (v > CLICK_KNEE) ? (float)(v - CLICK_KNEE) / (float)(127 - CLICK_KNEE) : 0.0f;
+	const float       knee   = (float)CLICK_KNEE / 127.0f;
+	if (t->clickBaseMaxLength < 0)
+		t->clickBaseMaxLength = t->envAtkClkMaxLength;
+	/* 0..96: the original response. Above: the contact noise grows to full
+	 * depth and the longest burst stretches to a whole fragment. */
+	t->envAttackClickLevel = (extra > 0.0f) ? knee + (1.0f - knee) * extra : (float)v / 127.0f;
+	t->envAtkClkMaxLength  = t->clickBaseMaxLength +
+	                         (int)((float)(BUFFER_SIZE_SAMPLES - t->clickBaseMaxLength) * extra);
+	/* The release never grows past its CC 96 value. */
+	t->envReleaseClickLevel = ((float)capped / 127.0f) * 0.53f;
+	t->releaseClickMix      = (float)capped / (float)CLICK_KNEE;
+	t->clickExtra           = extra;
 	initEnvelopes (t);
 }
 
@@ -2689,6 +2808,29 @@ initEnvelopes (struct b_tonegen* t)
 			}
 		}
 
+		/* elepiano: blend the configured linear release toward the click release.
+		 * Uses its own generator so the attack envelopes keep their rand() sequence. */
+		if (t->envReleaseModel == ENV_LINEAR && t->releaseClickMix > 0.0f) {
+			float       clk[BUFFER_SIZE_SAMPLES];
+			const float a = t->releaseClickMix;
+			burst         = 8 + (int)(clickNext (t) % 32u);
+			start         = (int)(clickNext (t) % (unsigned int)(bss - burst));
+			for (i = 0; i < start; i++)
+				clk[i] = 0.0f;
+			for (; i < (start + burst); i++) {
+				clk[i] = 1.0f - (float)(t->envReleaseClickLevel * ((double)(clickNext (t) >> 8) / 16777216.0));
+			}
+			for (; i < bss; i++)
+				clk[i] = 1.0f;
+			clk[0] /= 2.0f;
+			for (i = 1; i < bss; i++) {
+				clk[i] = (clk[i - 1] + clk[i]) / 2.0f;
+			}
+			for (i = 0; i < bss; i++) {
+				t->releaseEnv[b][i] = (1.0f - a) * t->releaseEnv[b][i] + a * clk[i];
+			}
+		}
+
 	} /* for each envelope buffer */
 }
 
@@ -3048,6 +3190,7 @@ initToneGenerator (struct b_tonegen* t, void* m)
 	/* Allocate taper buffers, initialize oscillator structs, build keyOsc. */
 	initOscillators (t, t->tgVariant, t->tgPrecision);
 	initAging (t);
+	initClickLayer (t);
 
 #ifdef KEYCOMPRESSION
 
@@ -3186,6 +3329,7 @@ oscKeyOff (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey)
 		t->keyDownCount--;
 		assert (0 <= t->keyDownCount);
 #endif /* KEYCOMPRESSION */
+		clickLayerKeyOff (t, keyNumber, t->keyGain[keyNumber]);
 		/* Write message saying that the key is released */
 		t->msgQueueGain[t->msgQueueWriter - t->msgQueue] = t->keyGain[keyNumber];
 		*t->msgQueueWriter++ = MSG_KEY_OFF (keyNumber);
@@ -3222,6 +3366,7 @@ oscKeyOn (struct b_tonegen* t, unsigned char keyNumber, unsigned char realKey, u
 	if (t->activeKeys[keyNumber] != 0) {
 		oscKeyOff (t, keyNumber, realKey);
 	}
+	clickLayerKeyOn (t, keyNumber, t->nextKeyGain);
 	/* The held press owns this gain. Capture it into KEY_OFF before a
 	 * later press can replace it, just as KEY_ON captures nextKeyGain. */
 	t->keyGain[keyNumber] = t->nextKeyGain;
@@ -3916,6 +4061,12 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			}
 			o->pos = pos;
 		}
+	}
+
+	if (t->clickBurst[0].env > 0.0f || t->clickBurst[1].env > 0.0f || t->clickBurst[2].env > 0.0f ||
+	    t->clickBurst[3].env > 0.0f || t->clickBurst[4].env > 0.0f || t->clickBurst[5].env > 0.0f ||
+	    t->clickBurst[6].env > 0.0f || t->clickBurst[7].env > 0.0f) {
+		clickLayerRender (t, swlBuffer);
 	}
 
 	/* ****************************************************************
