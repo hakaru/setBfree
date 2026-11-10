@@ -116,6 +116,8 @@ typedef struct _coreins {
 	float  npgain; /**< Next pgain */
 	float  vgain;  /**< Gain into vibrato buffer */
 	float  nvgain; /**< Next vgain */
+	float  wgain;  /**< elepiano: per-wheel aging gain at the first sample */
+	float  wstep;  /**< elepiano: per-sample increment of wgain */
 } CoreIns;
 
 /**
@@ -553,6 +555,18 @@ struct b_tonegen {
 	float leakageGain;                    /* 0.0=clean, max 0.02 */
 	float agingFactor;                    /* 0.0=new, 1.0=heavily aged */
 	float oscAgingGain[NOF_WHEELS + 1];   /* per-wheel HF roll-off multiplier */
+	/* elepiano: aging also moves each wheel's level (docs/superpowers/specs/2026-11-10-organ-realism-design.md).
+	 * wheelLive is the gain at the end of the current fragment, wheelLivePrev at its start. */
+	float        wheelLive[NOF_WHEELS + 1];
+	float        wheelLivePrev[NOF_WHEELS + 1];
+	float        wheelTrimUnit[NOF_WHEELS + 1];  /* fixed -1..1, zero mean */
+	float        wheelRotPhase[NOF_WHEELS + 1];  /* radians */
+	float        wheelRotInc[NOF_WHEELS + 1];    /* radians per fragment */
+	float        wheelDrift[NOF_WHEELS + 1];     /* -1..1, slow random */
+	float        wheelDriftTarget[NOF_WHEELS + 1];
+	int          wheelDriftCountdown[NOF_WHEELS + 1]; /* fragments until a new target */
+	unsigned int agingRng;
+	int          agingWasActive;
 
 	/* Serial contact switching (velocity-dependent staggered bus activation) */
 #define MAX_PENDING_KEYS 64

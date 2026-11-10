@@ -336,6 +336,8 @@ initValues (struct b_tonegen* t)
 
 	t->leakageGain = 0.0f;
 	t->agingFactor = 0.0f;
+	t->agingWasActive = 0;
+	t->agingRng       = 0xB3A61A01u;
 	{
 		int j;
 		for (j = 0; j <= NOF_WHEELS; j++)
@@ -1863,6 +1865,95 @@ setEnvReleaseClickLevel (struct b_tonegen* t, double u)
 /* Forward declaration (defined below, before initToneGenerator) */
 static void initEnvelopes (struct b_tonegen* t);
 
+/* ---- elepiano: aging moves each wheel's level ------------------------- */
+
+#define AGING_TRIM_DB 1.5f  /* fixed per-wheel level spread at aging 1.0 */
+#define AGING_ROT_DB 0.5f   /* once-per-revolution wobble */
+#define AGING_DRIFT_DB 0.8f /* slow irregular wobble */
+
+static unsigned int
+agingNext (struct b_tonegen* t)
+{
+	unsigned int x = t->agingRng;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	t->agingRng = x;
+	return x;
+}
+
+/* Uniform -1..1 */
+static float
+agingUniform (struct b_tonegen* t)
+{
+	return ((float)(agingNext (t) >> 8) / 8388608.0f) - 1.0f;
+}
+
+static int
+agingWheelTeeth (int w)
+{
+	static const int teeth[8] = { 2, 4, 8, 16, 32, 64, 128, 192 };
+	int              g        = (w - 1) / 12;
+	return teeth[g < 0 ? 0 : (g > 7 ? 7 : g)];
+}
+
+/* Called once after the oscillators exist. Deterministic. */
+static void
+initAging (struct b_tonegen* t)
+{
+	int   w;
+	float mean = 0.0f;
+	t->agingRng = 0xB3A61A01u;
+	for (w = 1; w <= NOF_WHEELS; w++) {
+		t->wheelTrimUnit[w] = agingUniform (t);
+		mean += t->wheelTrimUnit[w];
+	}
+	mean /= (float)NOF_WHEELS;
+	for (w = 0; w <= NOF_WHEELS; w++) {
+		double revHz = (w > 0) ? t->oscillators[w].frequency / (double)agingWheelTeeth (w) : 0.0;
+		if (w > 0)
+			t->wheelTrimUnit[w] -= mean;
+		else
+			t->wheelTrimUnit[w] = 0.0f;
+		t->wheelLive[w] = t->wheelLivePrev[w] = 1.0f;
+		t->wheelRotPhase[w]                   = (agingUniform (t) + 1.0f) * 3.14159265f;
+		t->wheelRotInc[w]       = (float)(6.283185307179586 * revHz * (double)BUFFER_SIZE_SAMPLES / SampleRateD);
+		t->wheelDrift[w]        = 0.0f;
+		t->wheelDriftTarget[w]  = agingUniform (t);
+		t->wheelDriftCountdown[w] = 1 + (int)(agingNext (t) % 64u);
+	}
+	t->agingWasActive = 0;
+}
+
+/* Advance every wheel by one fragment. Runs only while aging is (or just was) on. */
+static void
+agingAdvance (struct b_tonegen* t)
+{
+	const float a          = t->agingFactor;
+	const float fragSec    = (float)((double)BUFFER_SIZE_SAMPLES / SampleRateD);
+	const float driftCoeff = 1.0f - expf (-fragSec / 0.3f);
+	int         w;
+	for (w = 1; w <= NOF_WHEELS; w++) {
+		float dB;
+		t->wheelLivePrev[w] = t->wheelLive[w];
+		t->wheelRotPhase[w] += t->wheelRotInc[w];
+		if (t->wheelRotPhase[w] > 6.283185307f)
+			t->wheelRotPhase[w] = fmodf (t->wheelRotPhase[w], 6.283185307f);
+		if (--t->wheelDriftCountdown[w] <= 0) {
+			/* a new target every 0.5 .. 5 s (0.2 .. 2 Hz) */
+			float sec                 = 0.5f + 4.5f * (float)(agingNext (t) & 0xffffu) / 65535.0f;
+			t->wheelDriftTarget[w]    = agingUniform (t);
+			t->wheelDriftCountdown[w] = 1 + (int)(sec / fragSec);
+		}
+		t->wheelDrift[w] += driftCoeff * (t->wheelDriftTarget[w] - t->wheelDrift[w]);
+		dB = a * (AGING_TRIM_DB * t->wheelTrimUnit[w] + AGING_ROT_DB * sinf (t->wheelRotPhase[w]) +
+		          AGING_DRIFT_DB * t->wheelDrift[w]);
+		t->wheelLive[w] = (a > 0.0f) ? expf (dB * 0.115129255f) : 1.0f;
+	}
+	t->agingWasActive = (a > 0.0f);
+}
+
+
 /**
  * MIDI CC handler: set key-click level from CC value 0-127.
  * Updates both attack and release click levels and regenerates envelopes.
@@ -2927,6 +3018,7 @@ initToneGenerator (struct b_tonegen* t, void* m)
 
 	/* Allocate taper buffers, initialize oscillator structs, build keyOsc. */
 	initOscillators (t, t->tgVariant, t->tgPrecision);
+	initAging (t);
 
 #ifdef KEYCOMPRESSION
 
@@ -3409,6 +3501,11 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 		t->oldRouting = t->newRouting;
 	}
 
+	/* elepiano: aging wobble. Skipped entirely while aging is 0 (wheelLive stays 1.0). */
+	if (t->agingFactor > 0.0f || t->agingWasActive) {
+		agingAdvance (t);
+	}
+
 	/*
    * At this point, new oscillators has been added to the active list
    * and removed oscillators are still on the list.
@@ -3435,6 +3532,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			}
 
 			t->coreWriter->src   = osp->wave + osp->pos;
+			t->coreWriter->wgain = t->wheelLivePrev[oscNumber];
+			t->coreWriter->wstep = (t->wheelLive[oscNumber] - t->wheelLivePrev[oscNumber]) / (float)BUFFER_SIZE_SAMPLES;
 			t->coreWriter->off   = 0; /* Start at the beginning of target buffers */
 			t->coreWriter->sgain = aop->sumSwell;
 			t->coreWriter->pgain = aop->sumPercn;
@@ -3452,6 +3551,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 				t->coreWriter->src = osp->wave;
 				t->coreWriter->off = prev->cnt;
 				t->coreWriter->env = prev->env + prev->cnt;
+				t->coreWriter->wgain = prev->wgain + prev->wstep * (float)prev->cnt;
+				t->coreWriter->wstep = prev->wstep;
 
 				t->coreWriter->sgain = prev->sgain;
 				t->coreWriter->pgain = prev->pgain;
@@ -3571,6 +3672,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 			/* The source is the wave of the oscillator at its current position */
 			t->coreWriter->src = osp->wave + osp->pos;
 			t->coreWriter->off = 0;
+			t->coreWriter->wgain = t->wheelLivePrev[oscNumber];
+			t->coreWriter->wstep = (t->wheelLive[oscNumber] - t->wheelLivePrev[oscNumber]) / (float)BUFFER_SIZE_SAMPLES;
 
 			if (osp->lengthSamples < (osp->pos + BUFFER_SIZE_SAMPLES)) {
 				/* Instruction wraps source buffer */
@@ -3583,6 +3686,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 				t->coreWriter->opr = prev->opr; /* Same operation */
 				t->coreWriter->src = osp->wave; /* Start of wave because of wrap */
 				t->coreWriter->off = prev->cnt;
+				t->coreWriter->wgain = prev->wgain + prev->wstep * (float)prev->cnt;
+				t->coreWriter->wstep = prev->wstep;
 				if (t->coreWriter->opr & 2) {
 					t->coreWriter->env = prev->env + prev->cnt; /* Continue envelope */
 				}
@@ -3676,12 +3781,15 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 		const float  dp  = t->coreReader->npgain - gp;
 		const float* ep  = t->coreReader->env;
 		const float* xp  = t->coreReader->src;
+		float        wg  = t->coreReader->wgain;
+		const float  dw  = t->coreReader->wstep;
 		//printf("CR: %f %f +:%f  (ns:%f)\n", gs, ds, gs+ds, t->coreReader->nsgain );
 
 		if (opr & 1) {         /* ADD and ADDENV */
 			if (opr & 2) { /* ADDENV */
 				for (; 0 < n; n--) {
-					float       x = (float)(*xp++);
+					float       x = (float)(*xp++) * wg;
+					wg += dw;
 					const float e = *ep++;
 					*ys++ += x * (gs + (e * ds));
 					*yv++ += x * (gv + (e * dv));
@@ -3689,7 +3797,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 				}
 			} else { /* ADD */
 				for (; 0 < n; n--) {
-					const float x = (float)(*xp++);
+					const float x = (float)(*xp++) * wg;
+					wg += dw;
 					*ys++ += x * gs;
 					*yv++ += x * gv;
 					*yp++ += x * gp;
@@ -3699,7 +3808,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 		} else {
 			if (opr & 2) {               /* CPY and CPYENV */
 				for (; 0 < n; n--) { /* CPYENV */
-					const float x = (float)(*xp++);
+					const float x = (float)(*xp++) * wg;
+					wg += dw;
 					const float e = *ep++;
 					*ys++         = x * (gs + (e * ds));
 					*yv++         = x * (gv + (e * dv));
@@ -3708,7 +3818,8 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 
 			} else {
 				for (; 0 < n; n--) { /* CPY */
-					const float x = (float)(*xp++);
+					const float x = (float)(*xp++) * wg;
+					wg += dw;
 					*ys++         = x * gs;
 					*yv++         = x * gv;
 					*yp++         = x * gp;
