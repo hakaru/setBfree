@@ -571,6 +571,8 @@ struct b_tonegen {
 	 * release from the configured linear ramp to the click release. */
 	float        clickExtra;      /* 0 at CC <= 96, 1 at CC 127 */
 	float        releaseClickMix; /* 0 = configured release, 1 = click release */
+	float        releaseClickGain; /* elepiano: release noise scale, 1.0 at release CC 64 */
+	float        releaseClickBase; /* envReleaseClickLevel before the CC scaled it, <0 = not captured */
 	int          clickBaseMaxLength; /* envAtkClkMaxLength before the CC stretched it, -1 = not captured */
 	unsigned int clickRng;
 	float        clickLpCoeff;

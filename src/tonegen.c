@@ -340,7 +340,9 @@ initValues (struct b_tonegen* t)
 	t->agingRng       = 0xB3A61A01u;
 	t->percLevelScale = 1.0f;
 	t->clickExtra         = 0.0f;
-	t->releaseClickMix    = 1.0f; /* matches the default click CC 96 */
+	t->releaseClickMix    = 1.0f; /* matches the default release click CC 64 */
+	t->releaseClickGain   = 1.0f;
+	t->releaseClickBase   = -1.0f;
 	t->clickBaseMaxLength = -1;
 	t->clickRng           = 0xC11C4B3Fu;
 	memset (t->clickBurst, 0, sizeof (t->clickBurst));
@@ -1870,13 +1872,17 @@ setEnvReleaseClickLevel (struct b_tonegen* t, double u)
 
 /* Forward declaration (defined below, before initToneGenerator) */
 static void initEnvelopes (struct b_tonegen* t);
+static void initLinearReleaseEnvelope (struct b_tonegen* t, int b);
 
 /* ---- elepiano: aging moves each wheel's level ------------------------- */
 
-#define AGING_TRIM_DB 1.5f  /* fixed per-wheel level spread at aging 1.0 */
-#define AGING_ROT_DB 0.5f   /* once-per-revolution wobble */
-#define AGING_DRIFT_DB 0.8f /* slow irregular wobble */
-#define AGING_CROSSTALK 0.06f /* extra neighbour-wheel bleed at aging 1.0 */
+/* 2026-11-10: raised after listening ("more"). CC 64 now moves a held note
+ * about as much as CC 127 did with 1.5 / 0.5 / 0.8 / 0.06. The fast
+ * once-per-revolution term grows least: it is 16-31 Hz AM and turns rough. */
+#define AGING_TRIM_DB 3.0f  /* fixed per-wheel level spread at aging 1.0 */
+#define AGING_ROT_DB 0.8f   /* once-per-revolution wobble */
+#define AGING_DRIFT_DB 3.0f /* slow irregular wobble */
+#define AGING_CROSSTALK 0.12f /* extra neighbour-wheel bleed at aging 1.0 */
 
 static unsigned int
 agingNext (struct b_tonegen* t)
@@ -1982,11 +1988,12 @@ agingAdvance (struct b_tonegen* t)
 
 /**
  * MIDI CC handler: set key-click level from CC value 0-127.
- * Updates both attack and release click levels and regenerates envelopes.
+ * Updates the attack click level and regenerates envelopes.
  */
 #define CLICK_KNEE 96           /* CC value where the attack layer starts */
 #define CLICK_LAYER_GAIN 25.0f  /* attack noise at CC 127 with every drawbar out */
-#define CLICK_RELEASE_GAIN 4.5f /* release noise at CC >= 96 with every drawbar out */
+#define CLICK_RELEASE_GAIN 4.5f /* release noise at release CC 64 with every drawbar out */
+#define CLICK_RELEASE_CENTRE 64 /* release CC value that gives the amounts above */
 #define CLICK_LAYER_MS 4.0f     /* decay time constant of one burst */
 #define CLICK_LAYER_HZ 4000.0f  /* one-pole low-pass on the noise */
 #define CLICK_LAYER_STACK 3.0f  /* simultaneous bursts never exceed this many */
@@ -2059,11 +2066,11 @@ clickLayerKeyOn (struct b_tonegen* t, int keyNumber, float keyGain)
 	clickLayerBurst (t, keyNumber, keyGain, CLICK_LAYER_GAIN * t->clickExtra * t->clickExtra);
 }
 
-/* Key up: follows CC 0..96 and stays there above. */
+/* Key up: set by the release click CC alone. */
 static void
 clickLayerKeyOff (struct b_tonegen* t, int keyNumber, float keyGain)
 {
-	clickLayerBurst (t, keyNumber, keyGain, CLICK_RELEASE_GAIN * t->releaseClickMix * t->releaseClickMix);
+	clickLayerBurst (t, keyNumber, keyGain, CLICK_RELEASE_GAIN * t->releaseClickGain);
 }
 
 /* Adds the live bursts to the swell buffer (so the swell pedal scales them). */
@@ -2091,7 +2098,6 @@ static void
 setClickFromMIDI (void* d, unsigned char v)
 {
 	struct b_tonegen* t      = (struct b_tonegen*)d;
-	const int         capped = (v > CLICK_KNEE) ? CLICK_KNEE : v;
 	const float       extra  = (v > CLICK_KNEE) ? (float)(v - CLICK_KNEE) / (float)(127 - CLICK_KNEE) : 0.0f;
 	const float       knee   = (float)CLICK_KNEE / 127.0f;
 	if (t->clickBaseMaxLength < 0)
@@ -2101,11 +2107,42 @@ setClickFromMIDI (void* d, unsigned char v)
 	t->envAttackClickLevel = (extra > 0.0f) ? knee + (1.0f - knee) * extra : (float)v / 127.0f;
 	t->envAtkClkMaxLength  = t->clickBaseMaxLength +
 	                         (int)((float)(BUFFER_SIZE_SAMPLES - t->clickBaseMaxLength) * extra);
-	/* The release never grows past its CC 96 value. */
-	t->envReleaseClickLevel = ((float)capped / 127.0f) * 0.53f;
-	t->releaseClickMix      = (float)capped / (float)CLICK_KNEE;
-	t->clickExtra           = extra;
+	/* The release has its own control (setReleaseClickFromMIDI). */
+	t->clickExtra = extra;
 	initEnvelopes (t);
+}
+
+/**
+ * elepiano: release click amount, independent of the attack click.
+ * CC 64 is the configured amount, 0 the plain linear release, 127 about +12 dB
+ * of release noise. The envelope blend is complete at 64; above it only the
+ * noise grows.
+ */
+static void
+setReleaseClickFromMIDI (void* d, unsigned char v)
+{
+	struct b_tonegen* t      = (struct b_tonegen*)d;
+	const int         capped = (v > CLICK_RELEASE_CENTRE) ? CLICK_RELEASE_CENTRE : v;
+	const float       ratio  = (float)v / (float)CLICK_RELEASE_CENTRE;
+	const float       mix    = (float)capped / (float)CLICK_RELEASE_CENTRE;
+	const float       gain   = (v == CLICK_RELEASE_CENTRE) ? 1.0f : ratio * ratio;
+	if (t->releaseClickBase < 0.0f)
+		t->releaseClickBase = t->envReleaseClickLevel;
+	/* Unchanged (e.g. the default resent at start-up): keep the tables, so the
+	 * output stays byte-identical to never having received the CC. */
+	if (mix == t->releaseClickMix && gain == t->releaseClickGain)
+		return;
+	t->releaseClickMix      = mix;
+	t->envReleaseClickLevel = t->releaseClickBase * mix;
+	t->releaseClickGain     = gain;
+	if (t->envReleaseModel == ENV_LINEAR) {
+		int b;
+		/* Release tables only: the attack envelopes keep their shapes. */
+		for (b = 0; b < 9; b++)
+			initLinearReleaseEnvelope (t, b);
+	} else {
+		initEnvelopes (t);
+	}
 }
 
 /**
@@ -2675,6 +2712,41 @@ oscConfig (struct b_tonegen* t, ConfigContext* cfg)
 }
 
 /**
+ * elepiano: the linear release of one envelope buffer, blended toward the click
+ * release by releaseClickMix. Uses its own generator (not rand()), so calling it
+ * alone leaves the attack envelopes and their rand() sequence untouched.
+ */
+static void
+initLinearReleaseEnvelope (struct b_tonegen* t, int b)
+{
+	const int bss = BUFFER_SIZE_SAMPLES;
+	int       i;
+	for (i = 0; i < bss; i++) {
+		t->releaseEnv[b][i] = ((float)i) / (float)bss;
+	}
+	if (t->releaseClickMix > 0.0f) {
+		float       clk[BUFFER_SIZE_SAMPLES];
+		const float a     = t->releaseClickMix;
+		const int   burst = 8 + (int)(clickNext (t) % 32u);
+		const int   start = (int)(clickNext (t) % (unsigned int)(bss - burst));
+		for (i = 0; i < start; i++)
+			clk[i] = 0.0f;
+		for (; i < (start + burst); i++) {
+			clk[i] = 1.0f - (float)(t->envReleaseClickLevel * ((double)(clickNext (t) >> 8) / 16777216.0));
+		}
+		for (; i < bss; i++)
+			clk[i] = 1.0f;
+		clk[0] /= 2.0f;
+		for (i = 1; i < bss; i++) {
+			clk[i] = (clk[i - 1] + clk[i]) / 2.0f;
+		}
+		for (i = 0; i < bss; i++) {
+			t->releaseEnv[b][i] = (1.0f - a) * t->releaseEnv[b][i] + a * clk[i];
+		}
+	}
+}
+
+/**
  * This routine initialises the envelope shape tables.
  */
 static void
@@ -2804,38 +2876,7 @@ initEnvelopes (struct b_tonegen* t)
 		}
 
 		if (t->envReleaseModel == ENV_LINEAR) {
-			int k = BUFFER_SIZE_SAMPLES; /* TEST SPECIAL */
-
-			for (i = 0; i < BUFFER_SIZE_SAMPLES; i++) {
-				if (i < k) {
-					t->releaseEnv[b][i] = ((float)i) / (float)k;
-				} else {
-					t->releaseEnv[b][i] = 1.0;
-				}
-			}
-		}
-
-		/* elepiano: blend the configured linear release toward the click release.
-		 * Uses its own generator so the attack envelopes keep their rand() sequence. */
-		if (t->envReleaseModel == ENV_LINEAR && t->releaseClickMix > 0.0f) {
-			float       clk[BUFFER_SIZE_SAMPLES];
-			const float a = t->releaseClickMix;
-			burst         = 8 + (int)(clickNext (t) % 32u);
-			start         = (int)(clickNext (t) % (unsigned int)(bss - burst));
-			for (i = 0; i < start; i++)
-				clk[i] = 0.0f;
-			for (; i < (start + burst); i++) {
-				clk[i] = 1.0f - (float)(t->envReleaseClickLevel * ((double)(clickNext (t) >> 8) / 16777216.0));
-			}
-			for (; i < bss; i++)
-				clk[i] = 1.0f;
-			clk[0] /= 2.0f;
-			for (i = 1; i < bss; i++) {
-				clk[i] = (clk[i - 1] + clk[i]) / 2.0f;
-			}
-			for (i = 0; i < bss; i++) {
-				t->releaseEnv[b][i] = (1.0f - a) * t->releaseEnv[b][i] + a * clk[i];
-			}
+			initLinearReleaseEnvelope (t, b);
 		}
 
 	} /* for each envelope buffer */
@@ -3276,6 +3317,7 @@ initToneGenerator (struct b_tonegen* t, void* m)
 	useMIDIControlFunction (m, "percussion.level", setPercLevelFromMIDI, t);
 
 	useMIDIControlFunction (m, "osc.click.level", setClickFromMIDI, t);
+	useMIDIControlFunction (m, "osc.click.release", setReleaseClickFromMIDI, t);
 	useMIDIControlFunction (m, "osc.leakage", setLeakageFromMIDI, t);
 	useMIDIControlFunction (m, "osc.tone.aging", setAgingFromMIDI, t);
 
