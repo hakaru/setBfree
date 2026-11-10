@@ -102,6 +102,7 @@ static const char* ccFuncNames[] = {
 	"percussion.decay",    /* fast/slow */
 	"percussion.harmonic", /* 3rd/2nd */
 	"percussion.volume",
+	"percussion.level", /* elepiano: continuous level, 64 = unity */
 
 	"vibrato.knob",    /* off/v1/c1/v2/c2/v3/c3 */
 	"vibrato.routing", /* off/lower/upper/both */
@@ -990,6 +991,7 @@ midiPrimeControllerMapping (void* mcfg)
 	loadCCMap (m, "percussion.volume", 81, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "percussion.decay", 82, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "percussion.harmonic", 83, m->ctrlUseA, NULL, NULL);
+	loadCCMap (m, "percussion.level", 56, m->ctrlUseA, NULL, NULL);
 
 	loadCCMap (m, "vibrato.routing", 95, m->ctrlUseA, NULL, NULL);
 	loadCCMap (m, "vibrato.knob", 92, m->ctrlUseA, NULL, NULL);

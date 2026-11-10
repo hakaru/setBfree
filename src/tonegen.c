@@ -338,6 +338,7 @@ initValues (struct b_tonegen* t)
 	t->agingFactor = 0.0f;
 	t->agingWasActive = 0;
 	t->agingRng       = 0xB3A61A01u;
+	t->percLevelScale = 1.0f;
 	{
 		int j;
 		for (j = 0; j <= NOF_WHEELS; j++)
@@ -2948,6 +2949,21 @@ setPercVolumeFromMIDI (void* d, unsigned char u)
 }
 
 /**
+ * elepiano: continuous percussion level on top of soft/normal.
+ * CC 64 is exactly unity, 0 is -12 dB, 127 is +11.8 dB.
+ */
+static void
+setPercLevelFromMIDI (void* d, unsigned char u)
+{
+	struct b_tonegen* t = (struct b_tonegen*)d;
+	if (u == 64) {
+		t->percLevelScale = 1.0f;
+	} else {
+		t->percLevelScale = powf (10.0f, ((((float)u - 64.0f) / 64.0f) * 12.0f) / 20.0f);
+	}
+}
+
+/**
  * This routine controls the swell pedal from a MIDI controller.
  */
 static void
@@ -3107,6 +3123,7 @@ initToneGenerator (struct b_tonegen* t, void* m)
 	useMIDIControlFunction (m, "percussion.decay", setPercDecayFromMIDI, t);
 	useMIDIControlFunction (m, "percussion.harmonic", setPercHarmonicFromMIDI, t);
 	useMIDIControlFunction (m, "percussion.volume", setPercVolumeFromMIDI, t);
+	useMIDIControlFunction (m, "percussion.level", setPercLevelFromMIDI, t);
 
 	useMIDIControlFunction (m, "osc.click.level", setClickFromMIDI, t);
 	useMIDIControlFunction (m, "osc.leakage", setLeakageFromMIDI, t);
@@ -3985,7 +4002,7 @@ oscGenerateFragment (struct b_tonegen* t, float* buf, size_t lengthSamples)
 	}
 
 	if (t->upperKeyCount == 0) {
-		t->percEnvGain = t->percEnvGainReset;
+		t->percEnvGain = t->percEnvGainReset * t->percLevelScale;
 	}
 } /* oscGenerateFragment */
 
